@@ -1,3 +1,6 @@
 playwright>=1.40
-flask>=2.0
 requests>=2.25
+flask>=2.2
+psycopg2-binary>=2.9.9
+# mod_wsgi is built inside the Docker image (needs Apache headers); skipped on Windows
+mod_wsgi>=5.0.0; sys_platform != "win32"

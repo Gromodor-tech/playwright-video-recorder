@@ -1,64 +1,83 @@
 """
-web_service.py - lightweight web service + database layer (Flask + SQLite).
+web_service.py - lightweight web service + database layer (Flask + PostgreSQL).
 
 Endpoints:
     POST /upload                         UploadVideo  (multipart: file, company_name)
     GET  /get_video_url?company_name=X   GetVideoURL
     GET  /media/<filename>               serves an uploaded video file
     GET  /videos                         (optional) lists all records
+    GET  /health                         (optional) liveness + database check
 
-Run:
+In Docker the service runs under Apache + mod_wsgi (see app.wsgi), the database is
+a separate PostgreSQL container. Local run (needs a reachable PostgreSQL):
     python web_service.py
-Host / port can be overridden with the FLASK_HOST / FLASK_PORT environment variables
-(default 0.0.0.0:8000).
+Host / port: FLASK_HOST / FLASK_PORT (default 0.0.0.0:8000).
 
-Only flask + the Python standard library are used. The database is a single
-SQLite file (videos.db) that stores the company name, the absolute file path and
-the video URL - never the video bytes. Files live in ./uploads next to this script.
+Database connection settings come ONLY from environment variables:
+    DB_HOST (default localhost), DB_PORT (default 5432),
+    DB_NAME, DB_USER, DB_PASSWORD (required)
+Optional: DB_WAIT_TIMEOUT (seconds to wait for the database at startup, default 60),
+          UPLOAD_DIR (default ./uploads next to this file).
+
+The database stores the company name, the absolute file path and the video URL -
+never the video bytes. Files live in the uploads/ folder (a Docker volume).
 """
 
 import hashlib
 import os
 import re
-import sqlite3
+import time
 from urllib.parse import quote
 
+import psycopg2
+import psycopg2.extras
 from flask import Flask, g, jsonify, request, send_from_directory
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-DB_PATH = os.path.join(BASE_DIR, "videos.db")
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR") or os.path.join(BASE_DIR, "uploads")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id SERIAL PRIMARY KEY,
     company_name TEXT NOT NULL UNIQUE,
     file_path TEXT NOT NULL,   -- absolute path to the file on disk
     video_url TEXT NOT NULL,   -- public URL to the video
-    created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
 """
+
+# any constant: makes concurrent workers create the table one after another
+SCHEMA_LOCK_ID = 727274
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024    # 500 MB upload limit
 
 
 # ---------------------------------------------------------------------------
-# Database layer
+# Database layer (PostgreSQL via psycopg2)
 # ---------------------------------------------------------------------------
+def _db_settings():
+    """Read the connection settings from the environment (nothing is hard-coded)."""
+    missing = [n for n in ("DB_NAME", "DB_USER", "DB_PASSWORD") if not os.environ.get(n)]
+    if missing:
+        raise RuntimeError("Missing environment variables: " + ", ".join(missing))
+    return {
+        "host": os.environ.get("DB_HOST", "localhost"),
+        "port": int(os.environ.get("DB_PORT", "5432")),
+        "dbname": os.environ["DB_NAME"],
+        "user": os.environ["DB_USER"],
+        "password": os.environ["DB_PASSWORD"],
+    }
+
+
 def _connect():
-    """Open a NEW SQLite connection (one per request - connections are not shared
-    between threads). Busy timeout + WAL avoid 'database is locked' on concurrent uploads."""
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000")
-    conn.execute("PRAGMA journal_mode = WAL")
-    return conn
+    """Open a NEW connection (psycopg2 connections must not be shared between threads)."""
+    return psycopg2.connect(connect_timeout=5, **_db_settings())
 
 
 def get_db():
-    """Per-request connection stored in flask.g."""
+    """Per-request connection stored in flask.g, closed in teardown."""
     if "db" not in g:
         g.db = _connect()
     return g.db
@@ -68,15 +87,45 @@ def get_db():
 def close_db(_exc):
     conn = g.pop("db", None)
     if conn is not None:
-        conn.close()
+        conn.close()                    # an uncommitted transaction is rolled back
+
+
+def query_one(db, sql, params=()):
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        return cur.fetchone()
+
+
+def query_all(db, sql, params=()):
+    with db.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+
+def wait_for_db(timeout_seconds):
+    """Block until PostgreSQL accepts connections (it may still be starting)."""
+    deadline = time.time() + timeout_seconds
+    while True:
+        try:
+            _connect().close()
+            return
+        except psycopg2.OperationalError as exc:
+            if time.time() >= deadline:
+                raise
+            reason = (str(exc).strip().splitlines() or ["?"])[0]
+            print("[web_service] waiting for the database: " + reason, flush=True)
+            time.sleep(2)
 
 
 def init_db():
-    """Create uploads/ and videos.db (with the videos table) on first start."""
+    """Wait for the database, then create uploads/ and the videos table (idempotent)."""
     os.makedirs(UPLOAD_DIR, exist_ok=True)
+    wait_for_db(int(os.environ.get("DB_WAIT_TIMEOUT", "60")))
     conn = _connect()
     try:
-        conn.executescript(SCHEMA)
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_LOCK_ID,))
+            cur.execute(SCHEMA)
         conn.commit()
     finally:
         conn.close()
@@ -95,10 +144,11 @@ def _pick_filename(db, company_name, ext):
     """<safe company name><ext>; if a DIFFERENT company already owns that name
     (e.g. 'A/B' vs 'A_B'), add a short hash so files never overwrite each other."""
     filename = _safe_stem(company_name) + ext
-    row = db.execute(
-        "SELECT company_name FROM videos WHERE file_path = ?",
+    row = query_one(
+        db,
+        "SELECT company_name FROM videos WHERE file_path = %s",
         (os.path.join(UPLOAD_DIR, filename),),
-    ).fetchone()
+    )
     if row is not None and row["company_name"] != company_name:
         digest = hashlib.sha1(company_name.encode("utf-8")).hexdigest()[:8]
         filename = "{}_{}{}".format(_safe_stem(company_name), digest, ext)
@@ -107,6 +157,10 @@ def _pick_filename(db, company_name, ext):
 
 def _error(message, status):
     return jsonify({"error": message}), status
+
+
+def _jsonable(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
 
 
 # ---------------------------------------------------------------------------
@@ -140,17 +194,18 @@ def upload_video():
     video_url = request.host_url + "media/" + quote(filename)
 
     # upsert: re-uploading the same company_name updates the row (no duplicates)
-    db.execute(
-        """
-        INSERT INTO videos (company_name, file_path, video_url)
-        VALUES (?, ?, ?)
-        ON CONFLICT(company_name) DO UPDATE SET
-            file_path  = excluded.file_path,
-            video_url  = excluded.video_url,
-            updated_at = datetime('now')
-        """,
-        (company_name, file_path, video_url),
-    )
+    with db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO videos (company_name, file_path, video_url)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (company_name) DO UPDATE SET
+                file_path  = EXCLUDED.file_path,
+                video_url  = EXCLUDED.video_url,
+                updated_at = NOW()
+            """,
+            (company_name, file_path, video_url),
+        )
     db.commit()
 
     return jsonify({"company_name": company_name, "video_url": video_url}), 200
@@ -163,10 +218,11 @@ def get_video_url():
     if not company_name:
         return _error("company_name is required", 400)
 
-    row = get_db().execute(
-        "SELECT company_name, video_url FROM videos WHERE company_name = ?",
+    row = query_one(
+        get_db(),
+        "SELECT company_name, video_url FROM videos WHERE company_name = %s",
         (company_name,),
-    ).fetchone()
+    )
     if row is None:
         return _error("company not found: " + company_name, 404)
 
@@ -175,21 +231,33 @@ def get_video_url():
 
 @app.route("/media/<path:filename>", methods=["GET"])
 def media(filename):
-    """Serve a stored video (supports Range requests, so the browser player can seek)."""
+    """Serve a stored video. (In Docker Apache serves /media/ directly via Alias;
+    this route is the fallback for running the service without Apache.)"""
     return send_from_directory(UPLOAD_DIR, filename, conditional=True)
 
 
 @app.route("/videos", methods=["GET"])
 def list_videos():
     """(optional) list all records."""
-    rows = get_db().execute(
+    rows = query_all(
+        get_db(),
         "SELECT id, company_name, file_path, video_url, created_at, updated_at "
-        "FROM videos ORDER BY id"
-    ).fetchall()
-    return jsonify([dict(r) for r in rows]), 200
+        "FROM videos ORDER BY id",
+    )
+    return jsonify([{k: _jsonable(v) for k, v in row.items()} for row in rows]), 200
 
 
-# create videos.db and uploads/ as soon as the module is loaded
+@app.route("/health", methods=["GET"])
+def health():
+    """(optional) used by the Docker healthcheck: the web app is up and the DB answers."""
+    try:
+        query_one(get_db(), "SELECT 1 AS ok")
+    except psycopg2.Error:
+        return jsonify({"status": "database unavailable"}), 503
+    return jsonify({"status": "ok"}), 200
+
+
+# wait for PostgreSQL, then create uploads/ and the table as soon as the module is loaded
 init_db()
 
 

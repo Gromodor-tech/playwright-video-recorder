@@ -1,0 +1,41 @@
+services:
+  web:
+    build: .                       # Apache + mod_wsgi + Flask (see Dockerfile)
+    ports:
+      - "8000:80"                  # host 8000 -> Apache 80 inside the container
+    volumes:
+      - uploads:/app/uploads       # uploaded videos survive restarts
+    environment:                   # DB settings come from the environment (.env), nothing is hard-coded in the code
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-videos}
+      DB_USER: ${DB_USER:-video_user}
+      DB_PASSWORD: ${DB_PASSWORD:-video_pass}   # in production set a real password in .env / Docker secrets
+    depends_on:
+      db:
+        condition: service_healthy # start only when PostgreSQL is ready
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${DB_NAME:-videos}
+      POSTGRES_USER: ${DB_USER:-video_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-video_pass}
+    volumes:
+      - db_data:/var/lib/postgresql/data   # database survives restarts
+    healthcheck:
+      # -h 127.0.0.1: checks the real server over TCP, not the temporary one used during first init
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  db_data:
+  uploads:
