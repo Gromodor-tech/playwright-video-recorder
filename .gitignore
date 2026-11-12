@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+video/debug_*.png
+.venv/
+uploads/
+videos.db
+videos.db-wal
+videos.db-shm
+.env
