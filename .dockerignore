@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+__pycache__/
+*.pyc
+video/
+uploads/
+videos.db*
+*.webm
+README.md
+capture_video.py
+video_client.py
+qscript.py
+input.csv
