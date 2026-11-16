@@ -9,14 +9,19 @@ Only third-party dependency: playwright (sync API, Chromium).
 Python 3.9+.
 """
 
+import json
 import math
 import os
 import random
 import re
 import time
 
-from playwright.sync_api import Error as PlaywrightError
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+except ImportError:      # the pure zoom helpers stay importable (unit tests) without playwright
+    PlaywrightError = Exception
+    sync_playwright = None
 
 # ---------------------------------------------------------------------------
 # Global variable (main script may override it at startup)
@@ -31,6 +36,15 @@ VIEWPORT = {"width": 1280, "height": 720}
 # Set environment variable HEADLESS=0 to see the real browser window
 # (helps if DuckDuckGo ever shows a bot check in headless mode).
 HEADLESS = os.environ.get("HEADLESS", "1") != "0"
+
+# Zoom effect (Internship Task 2). The zoom itself is a POST effect (apply_zoom.py);
+# while recording only the toggle events are captured.
+VIDEO_FPS = 25                      # Playwright records videos at 25 fps
+ZOOM_FACTOR = 2.0
+ZOOM_RAMP_SEC = 0.5
+ZOOM_TIME_OFFSET_SEC = 0.0          # calibration: shifts every event time (video start vs. t0)
+# the sample scenario triggers a few zooms through window.__zoomAt (ZOOM_DEMO=0 turns it off)
+ENABLE_ZOOM_DEMO = os.environ.get("ZOOM_DEMO", "1") != "0"
 
 # Current DuckDuckGo selectors
 SEARCH_BOX = 'textarea[name="q"]'
@@ -178,6 +192,49 @@ OVERLAY_JS = r"""
     };
   };
 
+  // ----- Zoom toggle: F5 hotkey and window.__zoomAt(x, y) ----------------------------------
+  // The first call is the start of a zoom-in, the next one the start of the zoom-out, and so on.
+  // The state lives in Python (window.__zoomEmit is exposed by Playwright for the whole context,
+  // so it survives page navigations); Python answers with {type: 'in' | 'out'}.
+  const zoomRing = (x, y, kind) => {
+    const r0 = getRoot();
+    if (!r0) return;
+    const size = 90;
+    const color = kind === 'in' ? 'rgba(0,200,83,0.95)' : 'rgba(255,23,68,0.95)';   // green in, red out
+    const ring = document.createElement('div');
+    ring.style.cssText =
+      'position:fixed;left:' + (x - size / 2) + 'px;top:' + (y - size / 2) + 'px;' +
+      'width:' + size + 'px;height:' + size + 'px;border-radius:50%;box-sizing:border-box;' +
+      'border:5px solid ' + color + ';pointer-events:none;';
+    r0.insertBefore(ring, cur);
+    const from = kind === 'in' ? 'scale(1.7)' : 'scale(0.5)';
+    const a = ring.animate(
+      [{ transform: from, opacity: 0.95 }, { transform: 'scale(1)', opacity: 0 }],
+      { duration: 900, easing: 'ease-out' }
+    );
+    a.onfinish = () => ring.remove();
+  };
+
+  window.__zoomAt = async function (x, y) {
+    if (typeof x !== 'number' || typeof y !== 'number') { x = pos.x; y = pos.y; }   // current mouse
+    let kind = 'in';
+    try {
+      if (typeof window.__zoomEmit === 'function') {
+        const res = await window.__zoomEmit(Date.now(), Math.round(x), Math.round(y));
+        if (res && res.type) kind = res.type;
+      }
+    } catch (e) {}
+    zoomRing(x, y, kind);
+    return kind;
+  };
+
+  window.addEventListener('keydown', (e) => {
+    if (e.key !== 'F5' || e.repeat) return;
+    e.preventDefault();                 // do not reload the page
+    e.stopPropagation();
+    window.__zoomAt();
+  }, true);
+
   // Mount as soon as <html> exists and re-mount if the page ever removes the overlay.
   getRoot();
   document.addEventListener('DOMContentLoaded', getRoot);
@@ -279,6 +336,107 @@ def _safe_filename(name):
 
 
 # ---------------------------------------------------------------------------
+# Zoom events (Internship Task 2)
+# ---------------------------------------------------------------------------
+def sidecar_path_for(video_path):
+    """ACME_GmbH.webm -> ACME_GmbH.zoom.json (next to the video)."""
+    return os.path.splitext(video_path)[0] + ".zoom.json"
+
+
+class ZoomRecorder(object):
+    """Collects zoom toggle events {t, x, y, type} with t = seconds since the video start.
+
+    window.__zoomEmit (see OVERLAY_JS) calls on_toggle() for every F5 press or
+    window.__zoomAt() call. The first toggle is "in", the next one "out", and so on.
+    The timestamp comes from the browser (Date.now()), so the time the Python callback
+    happens to run does not matter. t = 0 is the moment right after the page (= the video)
+    was created; ZOOM_TIME_OFFSET_SEC lets you calibrate a constant shift.
+    """
+
+    def __init__(self, viewport=None, fps=VIDEO_FPS, zoom_factor=ZOOM_FACTOR,
+                 ramp_sec=ZOOM_RAMP_SEC, time_offset=0.0, clock=time.time):
+        self.viewport = dict(viewport or VIEWPORT)
+        self.fps = fps
+        self.zoom_factor = zoom_factor
+        self.ramp_sec = ramp_sec
+        self.time_offset = time_offset
+        self._clock = clock
+        self._t0 = None
+        self.zoomed = False
+        self.events = []
+
+    def start(self, t0=None):
+        """Mark t = 0 (call right after the page was created)."""
+        self._t0 = self._clock() if t0 is None else t0
+
+    def on_toggle(self, ts_ms, x, y):
+        """Callback for window.__zoomEmit(Date.now(), x, y); returns {"type": "in" | "out"}."""
+        if self._t0 is None:
+            self.start()
+        t = float(ts_ms) / 1000.0 - self._t0 + self.time_offset
+        kind = "out" if self.zoomed else "in"
+        self.zoomed = not self.zoomed
+        self.events.append({
+            "t": round(max(0.0, t), 3),
+            "x": int(round(float(x or 0))),
+            "y": int(round(float(y or 0))),
+            "type": kind,
+        })
+        return {"type": kind}
+
+    def sidecar_dict(self):
+        return {
+            "viewport": {"width": self.viewport["width"], "height": self.viewport["height"]},
+            "fps": self.fps,
+            "zoom_factor": self.zoom_factor,
+            "ramp_sec": self.ramp_sec,
+            "events": list(self.events),
+        }
+
+    def write_sidecar(self, video_path):
+        """Write <video>.zoom.json - ONLY when at least one event exists (normal recordings
+        are unaffected). Without events a stale sidecar from an earlier run is removed.
+        Returns the sidecar path or None."""
+        path = sidecar_path_for(video_path)
+        if not self.events:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return None
+        part = path + ".part"
+        with open(part, "w", encoding="utf-8") as handle:
+            json.dump(self.sidecar_dict(), handle, indent=2)
+            handle.write("\n")
+        os.replace(part, path)
+        return path
+
+
+def zoom_toggle(page, state, wait=True):
+    """Trigger the same toggle as the F5 key at the current mouse position (scenario helper).
+
+    Returns "in" / "out" (None when the zoom demo is switched off). With wait=True the
+    scenario pauses for one ramp so the zoom animation in the final video is finished before
+    the next action starts.
+    """
+    if not ENABLE_ZOOM_DEMO:
+        return None
+    kind = page.evaluate("([x, y]) => window.__zoomAt(x, y)", [state["x"], state["y"]])
+    if wait:
+        page.wait_for_timeout(int(ZOOM_RAMP_SEC * 1000) + 150)
+    return kind
+
+
+def zoom_pulse(page, state, hold_ms):
+    """Zoom in at the mouse position, hold, zoom out (two toggles)."""
+    if not ENABLE_ZOOM_DEMO:
+        return
+    zoom_toggle(page, state)
+    page.wait_for_timeout(hold_ms)
+    zoom_toggle(page, state)
+
+
+# ---------------------------------------------------------------------------
 # The scenario
 # ---------------------------------------------------------------------------
 def _run_scenario(page, url, city):
@@ -304,9 +462,15 @@ def _run_scenario(page, url, city):
     click_here(page)
     page.wait_for_timeout(400)
 
+    # zoom in on the search box while typing (1st toggle = zoom-in)
+    zoom_toggle(page, state)
+
     # 4. type the query symbol by symbol
     type_humanlike(page, query)
     page.wait_for_timeout(700)
+
+    # zoom back out (2nd toggle = zoom-out)
+    zoom_toggle(page, state)
 
     # 5. click the search button
     pressed_enter = False
@@ -333,6 +497,7 @@ def _run_scenario(page, url, city):
     target_y = box["y"] + min(box["height"] / 2, 14)
     move_cursor(page, state, target_x, target_y)
     page.wait_for_timeout(300)
+    zoom_pulse(page, state, hold_ms=1200)           # zoom in, hold, zoom out
     click_here(page)
 
     # let the clicked site load so the video shows the result of the click
@@ -369,7 +534,11 @@ def CaptureVideo_Magento(
     os.makedirs(out_dir, exist_ok=True)
     final_path = os.path.join(out_dir, _safe_filename(company_name) + ".webm")
 
+    if sync_playwright is None:
+        raise RuntimeError("playwright is not installed: pip install -r requirements.txt")
+
     tmp_path = None
+    zoom = None
     try:
         with sync_playwright() as pw:
             launch_kwargs = dict(
@@ -395,7 +564,11 @@ def CaptureVideo_Magento(
                     record_video_size=VIEWPORT,
                 )
                 context.add_init_script(script=OVERLAY_JS)
+                zoom = ZoomRecorder(VIEWPORT, VIDEO_FPS, ZOOM_FACTOR, ZOOM_RAMP_SEC,
+                                    time_offset=ZOOM_TIME_OFFSET_SEC)
+                context.expose_function("__zoomEmit", zoom.on_toggle)   # F5 / __zoomAt -> events
                 page = context.new_page()
+                zoom.start()                        # t = 0: the video starts with the page
                 video = page.video
 
                 scenario_error = None
@@ -423,6 +596,7 @@ def CaptureVideo_Magento(
             raise RuntimeError("Playwright did not produce a video file")
 
         os.replace(tmp_path, final_path)            # rename/move to <company_name>.webm
+        zoom.write_sidecar(final_path)              # <company_name>.zoom.json, only if there are events
         return final_path
 
     except Exception as exc:

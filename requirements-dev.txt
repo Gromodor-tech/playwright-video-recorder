@@ -1,0 +1,3 @@
+# test dependencies (ffmpeg must be installed for the ffmpeg integration tests, they are skipped otherwise)
+pytest>=7.0
+requests>=2.25

@@ -8,10 +8,18 @@ Usage:
     python capture_video.py --server http://127.0.0.1:8000    # + upload and preview
     python capture_video.py --server http://127.0.0.1:8000 --view-seconds 0
                                                               # keep the preview open until Enter
+    python capture_video.py --server http://127.0.0.1:8000 --wait-processed 300
+                                                              # wait for the zoom worker and
+                                                              # preview the ZOOMED video
+
+Zoom (Internship Task 2): the recording scenario triggers a few zooms; the events are saved in
+<video>.zoom.json next to the video. With --server the sidecar is uploaded with the video and the
+worker container renders the zoom (ffmpeg) and stores the result in PostgreSQL.
 """
 
 import argparse
 import csv
+import os
 
 import qscript
 
@@ -41,13 +49,27 @@ def preview_video(url, view_seconds):
             browser.close()
 
 
-def upload_and_preview(server_url, video_path, company_name, view_seconds):
-    """Upload one video, log the returned URL, preview it. Raises on failure."""
+def upload_and_preview(server_url, video_path, company_name, view_seconds, wait_processed=0):
+    """Upload one video (+ its zoom sidecar), log the URL(s), preview it. Raises on failure."""
     from video_client import UploadVideo                    # lazy: requests is only needed here
 
     video_url = UploadVideo(server_url, video_path, company_name)
     print("    uploaded: " + video_url)
-    preview_video(video_url, view_seconds)
+    preview_url = video_url
+
+    if os.path.isfile(qscript.sidecar_path_for(video_path)):
+        print("    zoom sidecar uploaded -> queued for processing")
+        if wait_processed > 0:
+            from video_client import WaitForProcessed
+            print("    waiting for the zoom worker (up to {} s) ...".format(wait_processed))
+            job = WaitForProcessed(server_url, company_name, timeout_sec=wait_processed)
+            if job["process_status"] == "done":
+                preview_url = job["processed_video_url"]
+                print("    zoomed video: " + preview_url)
+            else:
+                print("    zoom job status: {} {}".format(job["process_status"], job.get("process_error") or ""))
+
+    preview_video(preview_url, view_seconds)
 
 
 def parse_args():
@@ -58,6 +80,9 @@ def parse_args():
                         help="web service URL, e.g. http://127.0.0.1:8000 - enables upload + preview")
     parser.add_argument("--view-seconds", type=float, default=5,
                         help="preview time in seconds; 0 = keep the browser open until Enter (default: 5)")
+    parser.add_argument("--wait-processed", type=float, default=0, metavar="SECONDS",
+                        help="wait up to SECONDS for the zoom worker and preview the zoomed video "
+                             "(default: 0 = do not wait, preview the original)")
     return parser.parse_args()
 
 
@@ -95,10 +120,13 @@ def main():
 
             saved += 1
             print("    saved: " + path)
+            sidecar = qscript.sidecar_path_for(path)
+            if os.path.isfile(sidecar):
+                print("    zoom events: " + sidecar)
 
             if args.server:
                 try:
-                    upload_and_preview(args.server, path, company, args.view_seconds)
+                    upload_and_preview(args.server, path, company, args.view_seconds, args.wait_processed)
                     uploaded += 1
                 except Exception as exc:                    # never stop the batch loop
                     print("    UPLOAD/PREVIEW FAILED: {}".format(exc))

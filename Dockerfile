@@ -1,12 +1,13 @@
-# Apache + mod_wsgi + Flask video web service
+# Apache + mod_wsgi + Flask video web service, and the zoom worker (same image, other command)
 FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Apache, headers to build mod_wsgi (apxs), libpq for PostgreSQL, curl for the healthcheck
+# Apache, headers to build mod_wsgi (apxs), libpq for PostgreSQL, curl for the healthcheck,
+# ffmpeg for the zoom post-processing (apply_zoom.py, run by the worker)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends apache2 apache2-dev build-essential libpq-dev curl \
+ && apt-get install -y --no-install-recommends apache2 apache2-dev build-essential libpq-dev curl ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -20,7 +21,7 @@ RUN mod_wsgi-express module-config > /etc/apache2/mods-available/wsgi.load \
  && a2enmod wsgi
 
 # Application + Apache configuration
-COPY web_service.py app.wsgi ./
+COPY web_service.py worker.py apply_zoom.py app.wsgi ./
 COPY apache-video.conf /etc/apache2/sites-available/video-service.conf
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
