@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+video/debug_*.png
+.venv/
+uploads/
+videos.db
+videos.db-wal
+videos.db-shm
+.env
